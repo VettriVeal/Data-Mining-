@@ -1,0 +1,210 @@
+-- ============================================================
+-- ANNAPURNA - CURATION / NORMALIZATION
+-- A -> Step 11
+-- ============================================================
+
+-- Remove old curated data if this script is run again
+DROP TABLE IF EXISTS canonical_sales;
+
+-- ------------------------------------------------------------
+-- 1. S01-S05 : comma separated, normal column order
+-- ------------------------------------------------------------
+CREATE TEMP TABLE sales_a AS
+SELECT
+    bill_no::VARCHAR AS bill_no,
+    line_no::INTEGER AS line_no,
+    product_code::VARCHAR AS product_code,
+    qty::DECIMAL(18,3) AS qty,
+    unit_price::DECIMAL(18,2) AS unit_price,
+    line_type::VARCHAR AS line_type,
+    ts::TIMESTAMP AS ts
+FROM read_csv(
+    'C:/Users/ub02-glab-080/Downloads/data_2/data/sales/SALES_S0[1-5]_*.csv',
+    header=true,
+    delim=',',
+    columns={
+        'bill_no':'VARCHAR',
+        'line_no':'INTEGER',
+        'product_code':'VARCHAR',
+        'qty':'DECIMAL(18,3)',
+        'unit_price':'DECIMAL(18,2)',
+        'line_type':'VARCHAR',
+        'ts':'TIMESTAMP'
+    },
+    union_by_name=true
+);
+
+-- ------------------------------------------------------------
+-- 2. S06-S09 : semicolon separated + different column names
+-- ------------------------------------------------------------
+CREATE TEMP TABLE sales_b AS
+SELECT
+    bill_no::VARCHAR AS bill_no,
+    line_no::INTEGER AS line_no,
+    item_code::VARCHAR AS product_code,
+    quantity::DECIMAL(18,3) AS qty,
+    rate::DECIMAL(18,2) AS unit_price,
+    type::VARCHAR AS line_type,
+    try_strptime(txn_time, '%d-%m-%Y %H:%M:%S') AS ts
+FROM read_csv(
+    'C:/Users/ub02-glab-080/Downloads/data_2/data/sales/SALES_S0[6-9]_*.csv',
+    header=true,
+    delim=';',
+    columns={
+        'bill_no':'VARCHAR',
+        'line_no':'INTEGER',
+        'item_code':'VARCHAR',
+        'quantity':'DECIMAL(18,3)',
+        'rate':'DECIMAL(18,2)',
+        'type':'VARCHAR',
+        'txn_time':'VARCHAR'
+    },
+    union_by_name=true
+);
+
+-- ------------------------------------------------------------
+-- 3. S10-S12 : comma separated + different column order
+-- ------------------------------------------------------------
+CREATE TEMP TABLE sales_c AS
+SELECT
+    bill_no::VARCHAR AS bill_no,
+    line_no::INTEGER AS line_no,
+    product_code::VARCHAR AS product_code,
+    qty::DECIMAL(18,3) AS qty,
+    unit_price::DECIMAL(18,2) AS unit_price,
+    line_type::VARCHAR AS line_type,
+    to_timestamp(CAST(ts AS BIGINT))::TIMESTAMP AS ts
+FROM read_csv(
+    'C:/Users/ub02-glab-080/Downloads/data_2/data/sales/SALES_S1[0-2]_*.csv',
+    header=true,
+    delim=',',
+    columns={
+        'ts':'BIGINT',
+        'bill_no':'VARCHAR',
+        'line_no':'INTEGER',
+        'line_type':'VARCHAR',
+        'product_code':'VARCHAR',
+        'unit_price':'DECIMAL(18,2)',
+        'qty':'DECIMAL(18,3)'
+    },
+    union_by_name=true
+);
+
+-- ------------------------------------------------------------
+-- 4. Combine normalized CSV data
+-- ------------------------------------------------------------
+CREATE TEMP TABLE all_sales AS
+SELECT * FROM sales_a
+UNION ALL
+SELECT * FROM sales_b
+UNION ALL
+SELECT * FROM sales_c;
+
+-- ------------------------------------------------------------
+-- 5. Deduplicate individual sales lines
+--    Resends can be partial, so dedupe by bill + line.
+-- ------------------------------------------------------------
+CREATE TEMP TABLE deduped_sales AS
+SELECT *
+FROM (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY bill_no, line_no
+            ORDER BY ts DESC
+        ) AS rn
+    FROM all_sales
+)
+WHERE rn = 1;
+
+-- ------------------------------------------------------------
+-- 6. Create canonical sales table
+-- ------------------------------------------------------------
+CREATE TABLE canonical_sales AS
+SELECT
+    bill_no,
+    line_no,
+    product_code,
+    qty,
+    unit_price,
+    line_type,
+    ts,
+    strptime(
+    regexp_extract(bill_no, '/([0-9]{8})/', 1),
+    '%Y%m%d'
+)::DATE AS business_date
+FROM deduped_sales;
+
+-- ------------------------------------------------------------
+-- 7. Basic validation
+-- ------------------------------------------------------------
+SELECT
+    COUNT(*) AS canonical_row_count
+FROM canonical_sales;
+
+SELECT
+    line_type,
+    COUNT(*) AS row_count,
+    ROUND(SUM(qty * unit_price), 2) AS amount
+FROM canonical_sales
+GROUP BY line_type
+ORDER BY line_type;
+
+-- ------------------------------------------------------------
+-- 8. Checksum for idempotency proof
+-- ------------------------------------------------------------
+SELECT
+    md5(
+        string_agg(
+            md5(
+                concat_ws(
+                    '|',
+                    bill_no,
+                    CAST(line_no AS VARCHAR),
+                    product_code,
+                    CAST(qty AS VARCHAR),
+                    CAST(unit_price AS VARCHAR),
+                    line_type,
+                    CAST(business_date AS VARCHAR)
+                )
+            ),
+            '' ORDER BY bill_no, line_no
+        )
+    ) AS checksum
+FROM canonical_sales;
+
+-- ------------------------------------------------------------
+-- 9. Add partition columns
+-- ------------------------------------------------------------
+ALTER TABLE canonical_sales ADD COLUMN store_id VARCHAR;
+ALTER TABLE canonical_sales ADD COLUMN year INTEGER;
+ALTER TABLE canonical_sales ADD COLUMN month INTEGER;
+
+UPDATE canonical_sales
+SET
+    store_id = regexp_extract(bill_no, '^(S[0-9]{2})/', 1),
+    year = EXTRACT(YEAR FROM business_date)::INTEGER,
+    month = EXTRACT(MONTH FROM business_date)::INTEGER;
+
+-- ------------------------------------------------------------
+-- 10. Write partitioned curated Parquet
+-- ------------------------------------------------------------
+COPY canonical_sales
+TO 'curated_sales'
+(
+    FORMAT PARQUET,
+    PARTITION_BY (year, month, store_id),
+    OVERWRITE_OR_IGNORE
+);
+
+-- ------------------------------------------------------------
+-- 11. Final validation
+-- ------------------------------------------------------------
+SELECT COUNT(*) AS final_row_count
+FROM canonical_sales;
+
+SELECT
+    MIN(business_date) AS first_date,
+    MAX(business_date) AS last_date,
+    COUNT(DISTINCT store_id) AS stores
+FROM canonical_sales;
